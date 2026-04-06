@@ -1,0 +1,252 @@
+.\" SPDX-License-Identifier: CDDL-1.0
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.Dd April 6, 2026
+.Dt ZFSSUM 8
+.Os
+.
+.Sh NAME
+.Nm zfssum ,
+.Nm zfssum-server
+.Nd generate file fingerprints from ZFS block pointer checksums
+.
+.Sh SYNOPSIS
+.Nm zfssum
+.Op Fl l
+.Op Fl s Ar socket
+.Op Fl a Ar algo
+.Op Fl S
+.Op Fl Z
+.Ar dataset
+.Ar path Op Ar path ...
+.Pp
+.Nm zfssum-server
+.Op Fl d
+.Op Fl s Ar socket
+.Op Fl m Ar mode
+.Op Fl u Ar uid
+.Op Fl g Ar gid
+.
+.Sh DESCRIPTION
+.Nm zfssum
+generates a content fingerprint for files stored on a ZFS dataset by
+hashing the on-disk block pointer checksums rather than reading actual
+file data.
+This makes it significantly faster than traditional tools such as
+.Xr sha256sum 1
+for change detection, especially on large files.
+.Pp
+ZFS stores a checksum for every data block in its block pointer tree.
+.Nm
+walks the tree for each named file, collects the leaf-level block
+checksums, and hashes them together into a single digest.
+Because the leaf checksums depend on file content
+.Pq via the pool's checksum algorithm ,
+any change to the file data produces a different
+.Nm
+output.
+.Pp
+.Nm zfssum-server
+is a persistent daemon that keeps the pool open across requests,
+eliminating the per-invocation cost of
+.Fn objset.open .
+.Nm zfssum
+connects to a running
+.Nm zfssum-server
+by default.
+Use
+.Fl l
+to operate directly against the pool without the server
+.Pq slower per invocation .
+.
+.Sh OPTIONS
+.Ss zfssum options
+.Bl -tag -width "--skip-holes"
+.It Fl a , -algo Ar algo
+Hash algorithm used to combine block checksums.
+Supported values:
+.Bl -tag -width "blake3" -compact
+.It Cm blake3
+.Pq default
+BLAKE3, producing a 256-bit digest.
+.It Cm sha256
+SHA-256, producing a 256-bit digest.
+.It Cm sha512
+SHA-512, producing a 512-bit digest.
+.It Cm bp
+Root block pointer mode.
+Outputs the
+.Vt blk_cksum
+stored in the dnode's root block pointer directly, without walking the
+block tree.
+This is the fastest mode but the hash may change after
+.Nm zfs Cm send | Nm zfs Cm receive
+for multi-level files because the root checksum covers indirect block
+metadata
+.Pq DVAs, birth TXGs
+in addition to data checksums.
+When the dnode has multiple root block pointers or the root BP is
+embedded, the checksums are combined with BLAKE3.
+The
+.Fl S
+and
+.Fl Z
+options are ignored in this mode.
+.El
+.It Fl l , -local
+Local mode.
+Operate directly against the pool via
+.Sy libzpool
+instead of connecting to
+.Nm zfssum-server .
+Incurs
+.Fn kernel_init
+overhead on every invocation.
+.It Fl s , -socket Ar socket
+Path to the Unix domain socket of
+.Nm zfssum-server .
+Default:
+.Pa /var/run/zfssum.sock .
+.It Fl S , -no-size
+Do
+.Em not
+include the file size in the hash.
+By default the file size
+.Pq obtained from the SA attribute ZPL_SIZE
+is fed into the hash context before the block checksums.
+Including file size prevents theoretical collisions between files of
+different sizes whose block checksums happen to match.
+.It Fl Z , -skip-holes
+Skip holes instead of filling zeros.
+By default, 32 zero bytes are fed into the hash for each level-0
+hole block pointer
+.Pq Dv BP_GET_BIRTH Ns () Li == 0
+so that sparse files with different hole layouts produce different
+digests.
+With
+.Fl Z ,
+holes are silently skipped
+.Pq the original behavior .
+.El
+.Ss zfssum-server options
+.Bl -tag -width "--mode MODE"
+.It Fl d , -daemon
+Daemonize after creating the server socket.
+.It Fl s , -socket Ar socket
+Path for the Unix domain socket.
+Default:
+.Pa /var/run/zfssum.sock .
+.It Fl m , -mode Ar mode
+Set the permission mode of the Unix domain socket, specified as an
+octal value.
+Default:
+.Li 0666 .
+.It Fl u , -uid Ar uid
+Set the owner of the Unix domain socket to the specified numeric UID.
+By default the socket is owned by the user running the server.
+.It Fl g , -gid Ar gid
+Set the group of the Unix domain socket to the specified numeric GID.
+By default the socket inherits the group of the user running the server.
+.El
+.
+.Sh PROTOCOL
+.Nm zfssum-server
+listens on a Unix stream socket.
+Each client connection may send multiple requests, one per line.
+.Ss Request format
+.Bd -literal -offset indent
+<dataset>\\t<path>[\\t<opts>]\\n
+.Ed
+.Pp
+The optional third field
+.Ar opts
+is a comma-separated string of algorithm and flag tokens:
+.Bl -tag -width "skipholes" -compact
+.It Cm blake3 , sha256 , sha512 , bp
+Algorithm selection (default:
+.Cm blake3 ) .
+.It Cm size , nosize
+Include or exclude file size in hash (default:
+.Cm size ) .
+.It Cm holefill , skipholes
+Fill zeros for holes or skip them (default:
+.Cm holefill ) .
+.El
+.Pp
+When the third field is absent, the server uses
+.Cm blake3,size,holefill .
+.Ss Response format
+.Bd -literal -offset indent
+OK <hex-digest>\\n
+ERR <message>\\n
+.Ed
+.
+.Sh CAVEATS
+The digest produced by
+.Nm
+depends on the pool's storage configuration.
+The same logical file content stored with different settings will
+produce different digests:
+.Bl -bullet -compact
+.It
+.Sy Checksum algorithm
+.Pq e.g., sha256 vs blake3
+\(em different algorithms produce different per-block checksums.
+.It
+.Sy Record size
+.Pq e.g., Cm recordsize Ns = Ns 128K vs 1M
+\(em different block boundaries yield a different set of checksums.
+.It
+.Sy Compression
+.Pq e.g., lz4 vs zstd vs off
+\(em ZFS checksums are computed on post-compression data.
+.El
+.Pp
+This is inherent to the approach of reusing on-disk checksums.
+Digests are meaningful for comparison only within the same dataset
+or between datasets with identical storage properties.
+.Pp
+For embedded block pointers
+.Pq very small files whose data is stored inside the block pointer itself ,
+only the 14 payload words are hashed; the metadata words
+.Pq Vt blk_prop , Vt blk_birth_word Ns [1]
+are excluded so that the digest remains stable across
+.Nm zfs Cm send | Nm zfs Cm receive .
+.
+.Sh EXAMPLES
+Generate a fingerprint using the default algorithm (BLAKE3):
+.Bd -literal -offset indent
+# zfssum tank/data path/to/file
+a1b2c3d4...
+.Ed
+.Pp
+Use SHA-512 in local mode without the server:
+.Bd -literal -offset indent
+# zfssum -l -a sha512 tank/data myfile
+e5f6a7b8...
+.Ed
+.Pp
+Fast root block pointer hash for change detection:
+.Bd -literal -offset indent
+# zfssum -a bp tank/data largefile
+1234abcd...
+.Ed
+.Pp
+Start the server as a daemon with group-writable socket:
+.Bd -literal -offset indent
+# zfssum-server -d --mode 0660 --gid 1000
+.Ed
+.
+.Sh SEE ALSO
+.Xr sha256sum 1 ,
+.Xr b3sum 1 ,
+.Xr zdb 8 ,
+.Xr zfs 8

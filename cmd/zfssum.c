@@ -23,7 +23,7 @@
  * zfssum - Generate a file content fingerprint from ZFS block checksums.
  *
  * By default, queries a running zfssum-server daemon via Unix socket.
- * With --local, operates directly against the pool (slow due to
+ * With -l, operates directly against the pool (slow due to
  * kernel_init / spa_open overhead per invocation).
  */
 
@@ -33,6 +33,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <getopt.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -55,6 +56,7 @@
 #include <sys/dsl_scan.h>
 #include <sys/blkptr.h>
 #include <sys/sha2.h>
+#include <sys/blake3.h>
 #include <libzpool.h>
 
 extern int reference_tracking_enable;
@@ -63,6 +65,127 @@ extern uint_t zfs_vdev_async_read_max_active;
 extern boolean_t spa_load_verify_dryrun;
 extern boolean_t spa_mode_readable_spacemaps;
 extern uint_t zfs_btree_verify_intensity;
+
+/* ------------------------------------------------------------------ */
+/*  Hash algorithm abstraction                                        */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+	HASH_SHA256,
+	HASH_SHA512,
+	HASH_BLAKE3,
+	HASH_BP
+} hash_algo_t;
+
+typedef struct {
+	hash_algo_t algo;
+	union {
+		SHA2_CTX sha2;
+		BLAKE3_CTX blake3;
+	};
+	unsigned digest_len;
+} hash_ctx_t;
+
+typedef struct {
+	hash_algo_t algo;
+	boolean_t include_size;
+	boolean_t fill_holes;
+} zfssum_opts_t;
+
+#define	MAX_DIGEST_LEN	SHA512_DIGEST_LENGTH	/* 64 */
+#define	MAX_HEX_LEN	(MAX_DIGEST_LEN * 2 + 1)
+
+static const zfssum_opts_t default_opts = {
+	.algo = HASH_BLAKE3,
+	.include_size = B_TRUE,
+	.fill_holes = B_TRUE,
+};
+
+static void
+hash_init(hash_ctx_t *h, hash_algo_t algo)
+{
+	h->algo = algo;
+	switch (algo) {
+	case HASH_SHA256:
+		SHA2Init(SHA256, &h->sha2);
+		h->digest_len = SHA256_DIGEST_LENGTH;
+		break;
+	case HASH_SHA512:
+		SHA2Init(SHA512, &h->sha2);
+		h->digest_len = SHA512_DIGEST_LENGTH;
+		break;
+	case HASH_BLAKE3:
+		Blake3_Init(&h->blake3);
+		h->digest_len = BLAKE3_OUT_LEN;
+		break;
+	default:
+		abort();
+	}
+}
+
+static void
+hash_update(hash_ctx_t *h, const void *data, size_t len)
+{
+	switch (h->algo) {
+	case HASH_SHA256:
+	case HASH_SHA512:
+		SHA2Update(&h->sha2, data, len);
+		break;
+	case HASH_BLAKE3:
+		Blake3_Update(&h->blake3, data, len);
+		break;
+	default:
+		abort();
+	}
+}
+
+static void
+hash_final(hash_ctx_t *h, unsigned char *digest)
+{
+	switch (h->algo) {
+	case HASH_SHA256:
+	case HASH_SHA512:
+		SHA2Final(digest, &h->sha2);
+		break;
+	case HASH_BLAKE3:
+		Blake3_Final(&h->blake3, digest);
+		break;
+	default:
+		abort();
+	}
+}
+
+static hash_algo_t
+parse_algo(const char *name)
+{
+	if (strcmp(name, "sha256") == 0)
+		return (HASH_SHA256);
+	if (strcmp(name, "sha512") == 0)
+		return (HASH_SHA512);
+	if (strcmp(name, "blake3") == 0)
+		return (HASH_BLAKE3);
+	if (strcmp(name, "bp") == 0)
+		return (HASH_BP);
+	return ((hash_algo_t)-1);
+}
+
+static void
+opts_to_str(const zfssum_opts_t *opts, char *buf, size_t bufsz)
+{
+	const char *algo;
+	switch (opts->algo) {
+	case HASH_SHA256: algo = "sha256"; break;
+	case HASH_SHA512: algo = "sha512"; break;
+	case HASH_BLAKE3: algo = "blake3"; break;
+	case HASH_BP:     algo = "bp"; break;
+	default:          algo = "unknown"; break;
+	}
+	(void) snprintf(buf, bufsz, "%s,%s,%s", algo,
+	    opts->include_size ? "size" : "nosize",
+	    opts->fill_holes ? "holefill" : "skipholes");
+}
+
+/* ------------------------------------------------------------------ */
 
 static const char cmdname[] = "zfssum";
 
@@ -83,13 +206,20 @@ static void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "usage: %s [-l] [-s socket_path] <dataset> <path> [path ...]\n\n",
-	    cmdname);
+	    "usage: %s [-l] [-s socket] [-a algo] [-S] [-Z]"
+	    " <dataset> <path> [path ...]\n\n", cmdname);
 	(void) fprintf(stderr,
-	    "  Generate a SHA256 fingerprint of a file from ZFS block\n"
-	    "  pointer checksums, without reading file data.\n\n"
-	    "  -l         local mode (no server, slow per invocation)\n"
-	    "  -s PATH    server socket (default: /var/run/zfssum.sock)\n");
+	    "  Generate a fingerprint of a file from ZFS block pointer\n"
+	    "  checksums, without reading file data.\n\n"
+	    "  -a, --algo ALGO    hash algorithm: blake3 (default),"
+	    " sha256, sha512, bp\n"
+	    "  -l, --local        local mode"
+	    " (no server, slow per invocation)\n"
+	    "  -s, --socket PATH  server socket"
+	    " (default: /var/run/zfssum.sock)\n"
+	    "  -S, --no-size      do NOT include file size in hash\n"
+	    "  -Z, --skip-holes   skip holes instead of"
+	    " filling zeros\n");
 	exit(1);
 }
 
@@ -153,22 +283,42 @@ close_objset(objset_t *os, const void *tag)
 	sa_os = NULL;
 }
 
-static void
-hash_blkptr_cksum(SHA2_CTX *ctx, const blkptr_t *bp)
+static uint64_t
+get_file_size(objset_t *os, uint64_t object)
 {
-	SHA2Update(ctx, bp->blk_cksum.zc_word,
+	uint64_t size = 0;
+	sa_handle_t *hdl;
+
+	if (object == 0 || sa_attr_table == NULL)
+		return (0);
+	if (sa_handle_get(os, object, NULL, SA_HDL_PRIVATE, &hdl) == 0) {
+		(void) sa_lookup(hdl, sa_attr_table[ZPL_SIZE],
+		    &size, sizeof (size));
+		sa_handle_destroy(hdl);
+	}
+	return (size);
+}
+
+static void
+hash_blkptr_cksum(hash_ctx_t *ctx, const blkptr_t *bp)
+{
+	hash_update(ctx, bp->blk_cksum.zc_word,
 	    sizeof (bp->blk_cksum.zc_word));
 }
 
 static void
-hash_embedded_bp(SHA2_CTX *ctx, const blkptr_t *bp)
+hash_embedded_bp(hash_ctx_t *ctx, const blkptr_t *bp)
 {
-	SHA2Update(ctx, bp, sizeof (blkptr_t));
+	const uint64_t *words = (const uint64_t *)bp;
+	for (unsigned i = 0; i < sizeof (blkptr_t) / sizeof (uint64_t); i++) {
+		if (BPE_IS_PAYLOADWORD(bp, &words[i]))
+			hash_update(ctx, &words[i], sizeof (uint64_t));
+	}
 }
 
 static void
 process_leaf_bp(const blkptr_t *bp, const zbookmark_phys_t *zb,
-    const dnode_phys_t *dnp, SHA2_CTX *ctx)
+    const dnode_phys_t *dnp, hash_ctx_t *ctx)
 {
 	if (!BP_IS_EMBEDDED(bp)) {
 		ASSERT3U(BP_GET_TYPE(bp), ==, dnp->dn_type);
@@ -184,12 +334,18 @@ process_leaf_bp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 
 static int
 visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
-    blkptr_t *bp, const zbookmark_phys_t *zb, SHA2_CTX *ctx)
+    blkptr_t *bp, const zbookmark_phys_t *zb,
+    hash_ctx_t *ctx, boolean_t fill_holes)
 {
 	int err = 0;
 
-	if (BP_GET_BIRTH(bp) == 0)
+	if (BP_GET_BIRTH(bp) == 0) {
+		if (zb->zb_level == 0 && fill_holes) {
+			static const uint8_t zeros[32] = { 0 };
+			hash_update(ctx, zeros, sizeof (zeros));
+		}
 		return (0);
+	}
 
 	if (zb->zb_level == 0) {
 		process_leaf_bp(bp, zb, dnp, ctx);
@@ -217,7 +373,8 @@ visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
 			SET_BOOKMARK(&czb, zb->zb_objset, zb->zb_object,
 			    zb->zb_level - 1,
 			    zb->zb_blkid * epb + i);
-			err = visit_indirect(spa, dnp, cbp, &czb, ctx);
+			err = visit_indirect(spa, dnp, cbp, &czb, ctx,
+			    fill_holes);
 			if (err)
 				break;
 			fill += BP_GET_FILL(cbp);
@@ -230,66 +387,130 @@ visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
 	return (err);
 }
 
-static void
-dump_file_hash(dnode_t *dn, unsigned char digest[SHA256_DIGEST_LENGTH])
+static int
+dump_file_hash(dnode_t *dn, uint64_t file_size,
+    const zfssum_opts_t *opts, unsigned char *digest, unsigned *digest_len)
 {
 	dnode_phys_t *dnp = dn->dn_phys;
 	zbookmark_phys_t czb;
-	SHA2_CTX ctx;
+	hash_ctx_t ctx;
 
-	SHA2Init(SHA256, &ctx);
+	hash_init(&ctx, opts->algo);
+	*digest_len = ctx.digest_len;
+
+	if (opts->include_size)
+		hash_update(&ctx, &file_size, sizeof (file_size));
 
 	SET_BOOKMARK(&czb, dmu_objset_id(dn->dn_objset),
 	    dn->dn_object, dnp->dn_nlevels - 1, 0);
 	for (int j = 0; j < dnp->dn_nblkptr; j++) {
 		czb.zb_blkid = j;
 		int err = visit_indirect(dmu_objset_spa(dn->dn_objset), dnp,
-		    &dnp->dn_blkptr[j], &czb, &ctx);
+		    &dnp->dn_blkptr[j], &czb, &ctx, opts->fill_holes);
 		if (err)
-			fatal("visit_indirect failed: %s", strerror(err));
+			return (err);
 	}
 
-	SHA2Final(digest, &ctx);
+	hash_final(&ctx, digest);
+	return (0);
 }
 
-static void
+static int
+dump_file_bp_hash(dnode_t *dn, unsigned char *digest, unsigned *digest_len)
+{
+	dnode_phys_t *dnp = dn->dn_phys;
+	int nactive = 0;
+	boolean_t have_embedded = B_FALSE;
+	int single_idx = -1;
+
+	for (int j = 0; j < dnp->dn_nblkptr; j++) {
+		blkptr_t *bp = &dnp->dn_blkptr[j];
+		if (BP_GET_BIRTH(bp) != 0) {
+			nactive++;
+			single_idx = j;
+			if (BP_IS_EMBEDDED(bp))
+				have_embedded = B_TRUE;
+		}
+	}
+
+	if (nactive == 1 && !have_embedded) {
+		memcpy(digest,
+		    dnp->dn_blkptr[single_idx].blk_cksum.zc_word,
+		    sizeof (zio_cksum_t));
+		*digest_len = sizeof (zio_cksum_t);
+		return (0);
+	}
+
+	BLAKE3_CTX ctx;
+	Blake3_Init(&ctx);
+	for (int j = 0; j < dnp->dn_nblkptr; j++) {
+		blkptr_t *bp = &dnp->dn_blkptr[j];
+		if (BP_GET_BIRTH(bp) == 0)
+			continue;
+		if (BP_IS_EMBEDDED(bp)) {
+			const uint64_t *w = (const uint64_t *)bp;
+			for (unsigned i = 0;
+			    i < sizeof (blkptr_t) / sizeof (uint64_t); i++) {
+				if (BPE_IS_PAYLOADWORD(bp, &w[i]))
+					Blake3_Update(&ctx, &w[i],
+					    sizeof (uint64_t));
+			}
+		} else {
+			Blake3_Update(&ctx, bp->blk_cksum.zc_word,
+			    sizeof (bp->blk_cksum.zc_word));
+		}
+	}
+	Blake3_Final(&ctx, digest);
+	*digest_len = BLAKE3_OUT_LEN;
+	return (0);
+}
+
+static int
 dump_object(objset_t *os, uint64_t object,
-    unsigned char digest[SHA256_DIGEST_LENGTH])
+    const zfssum_opts_t *opts, unsigned char *digest, unsigned *digest_len)
 {
 	dmu_buf_t *db = NULL;
 	dmu_object_info_t doi;
 	dnode_t *dn;
 	boolean_t dnode_held = B_FALSE;
 	int error;
+	uint64_t file_size = 0;
 
 	if (object == 0) {
 		dn = DMU_META_DNODE(os);
 	} else {
 		error = dmu_object_info(os, object, &doi);
 		if (error)
-			fatal("dmu_object_info() failed, errno %u", error);
+			return (error);
 
 		if (os->os_encrypted &&
 		    DMU_OT_IS_ENCRYPTED(doi.doi_bonus_type)) {
 			error = dnode_hold(os, object, FTAG, &dn);
 			if (error)
-				fatal("dnode_hold() failed, errno %u", error);
+				return (error);
 			dnode_held = B_TRUE;
 		} else {
 			error = dmu_bonus_hold(os, object, FTAG, &db);
 			if (error)
-				fatal("dmu_bonus_hold(%llu) failed, errno %u",
-				    (u_longlong_t)object, error);
+				return (error);
 			dn = DB_DNODE((dmu_buf_impl_t *)db);
 		}
 	}
 
-	dump_file_hash(dn, digest);
+	if (opts->include_size && opts->algo != HASH_BP)
+		file_size = get_file_size(os, object);
+
+	if (opts->algo == HASH_BP)
+		error = dump_file_bp_hash(dn, digest, digest_len);
+	else
+		error = dump_file_hash(dn, file_size, opts,
+		    digest, digest_len);
 
 	if (db != NULL)
 		dmu_buf_rele(db, FTAG);
 	if (dnode_held)
 		dnode_rele(dn, FTAG);
+	return (error);
 }
 
 static int
@@ -352,8 +573,8 @@ dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
 
 static int
 hash_path_from_root(objset_t *os, uint64_t root_obj,
-    const char *ds, const char *path,
-    unsigned char digest[SHA256_DIGEST_LENGTH])
+    const char *ds, const char *path, const zfssum_opts_t *opts,
+    unsigned char *digest, unsigned *digest_len)
 {
 	int err;
 	uint64_t object;
@@ -369,15 +590,14 @@ hash_path_from_root(objset_t *os, uint64_t root_obj,
 	if (err != 0)
 		return (err);
 
-	dump_object(os, object, digest);
-	return (0);
+	return (dump_object(os, object, opts, digest, digest_len));
 }
 
 static void
-print_digest(const unsigned char digest[SHA256_DIGEST_LENGTH],
+print_digest(const unsigned char *digest, unsigned digest_len,
     const char *path, int include_path)
 {
-	for (unsigned int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+	for (unsigned int i = 0; i < digest_len; i++)
 		(void) printf("%02x", digest[i]);
 
 	if (include_path)
@@ -386,7 +606,7 @@ print_digest(const unsigned char digest[SHA256_DIGEST_LENGTH],
 }
 
 static int
-run_local(int argc, char **argv, int optidx)
+run_local(int argc, char **argv, int optidx, const zfssum_opts_t *opts)
 {
 	char *spa_config_path_env;
 	objset_t *os = NULL;
@@ -432,14 +652,15 @@ run_local(int argc, char **argv, int optidx)
 	}
 
 	for (int i = optidx; i < argc; i++) {
-		unsigned char digest[SHA256_DIGEST_LENGTH];
+		unsigned char digest[MAX_DIGEST_LEN];
+		unsigned digest_len;
 
 		ret = hash_path_from_root(os, root_obj, dataset,
-		    argv[i], digest);
+		    argv[i], opts, digest, &digest_len);
 		if (ret != 0)
 			goto out;
 
-		print_digest(digest, argv[i], include_path);
+		print_digest(digest, digest_len, argv[i], include_path);
 	}
 
 out:
@@ -472,18 +693,21 @@ connect_socket(const char *sock_path)
 }
 
 static int
-run_server(int argc, char **argv, int optidx, const char *sock_path)
+run_server(int argc, char **argv, int optidx, const char *sock_path,
+    const zfssum_opts_t *opts)
 {
 	char *dataset;
 	int include_path;
 	int fd;
 	FILE *fp;
+	char opts_str[64];
 
 	if (optidx + 2 > argc)
 		usage();
 
 	dataset = argv[optidx++];
 	include_path = ((argc - optidx) > 1);
+	opts_to_str(opts, opts_str, sizeof (opts_str));
 
 	fd = connect_socket(sock_path);
 	if (fd < 0) {
@@ -503,7 +727,8 @@ run_server(int argc, char **argv, int optidx, const char *sock_path)
 		char *nl;
 		const char *path = argv[i];
 
-		if (fprintf(fp, "%s\t%s\n", dataset, path) < 0 ||
+		if (fprintf(fp, "%s\t%s\t%s\n",
+		    dataset, path, opts_str) < 0 ||
 		    fflush(fp) != 0) {
 			(void) fclose(fp);
 			fatal("socket write failed: %s", strerror(errno));
@@ -547,15 +772,37 @@ main(int argc, char **argv)
 {
 	const char *sock_path = "/var/run/zfssum.sock";
 	boolean_t local_mode = B_FALSE;
+	zfssum_opts_t opts = default_opts;
 	int c;
 
-	while ((c = getopt(argc, argv, "ls:")) != -1) {
+	static struct option long_options[] = {
+		{"algo",	required_argument,	NULL, 'a'},
+		{"local",	no_argument,		NULL, 'l'},
+		{"socket",	required_argument,	NULL, 's'},
+		{"no-size",	no_argument,		NULL, 'S'},
+		{"skip-holes",	no_argument,		NULL, 'Z'},
+		{0, 0, 0, 0}
+	};
+
+	while ((c = getopt_long(argc, argv, "a:ls:SZ",
+	    long_options, NULL)) != -1) {
 		switch (c) {
+		case 'a':
+			opts.algo = parse_algo(optarg);
+			if ((int)opts.algo == -1)
+				fatal("unknown algorithm '%s'", optarg);
+			break;
 		case 'l':
 			local_mode = B_TRUE;
 			break;
 		case 's':
 			sock_path = optarg;
+			break;
+		case 'S':
+			opts.include_size = B_FALSE;
+			break;
+		case 'Z':
+			opts.fill_holes = B_FALSE;
 			break;
 		default:
 			usage();
@@ -563,7 +810,7 @@ main(int argc, char **argv)
 	}
 
 	if (local_mode)
-		return (run_local(argc, argv, optind));
+		return (run_local(argc, argv, optind, &opts));
 	else
-		return (run_server(argc, argv, optind, sock_path));
+		return (run_server(argc, argv, optind, sock_path, &opts));
 }
