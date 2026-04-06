@@ -20,11 +20,13 @@
  */
 
 /*
- * zfssum - Generate a file content fingerprint from ZFS block checksums.
+ * zfssum-server - persistent daemon for zfssum requests.
  *
- * By default, queries a running zfssum-server daemon via Unix socket.
- * With --local, operates directly against the pool (slow due to
- * kernel_init / spa_open overhead per invocation).
+ * Protocol (Unix stream socket, one request per line):
+ *   <dataset>\t<path>\n
+ * Response:
+ *   OK <hex-digest>\n
+ *   ERR <message>\n
  */
 
 #include <stdio.h>
@@ -64,7 +66,10 @@ extern boolean_t spa_load_verify_dryrun;
 extern boolean_t spa_mode_readable_spacemaps;
 extern uint_t zfs_btree_verify_intensity;
 
-static const char cmdname[] = "zfssum";
+static const char cmdname[] = "zfssum-server";
+static char curpath[PATH_MAX];
+static objset_t *sa_os = NULL;
+static sa_attr_type_t *sa_attr_table = NULL;
 
 static void __attribute__((noreturn))
 fatal(const char *fmt, ...)
@@ -82,24 +87,9 @@ fatal(const char *fmt, ...)
 static void
 usage(void)
 {
-	(void) fprintf(stderr,
-	    "usage: %s [-l] [-s socket_path] <dataset> <path> [path ...]\n\n",
-	    cmdname);
-	(void) fprintf(stderr,
-	    "  Generate a SHA256 fingerprint of a file from ZFS block\n"
-	    "  pointer checksums, without reading file data.\n\n"
-	    "  -l         local mode (no server, slow per invocation)\n"
-	    "  -s PATH    server socket (default: /var/run/zfssum.sock)\n");
+	(void) fprintf(stderr, "usage: %s [-d] [-s socket_path]\n", cmdname);
 	exit(1);
 }
-
-/* ------------------------------------------------------------------ */
-/*  Local (direct libzpool) mode                                      */
-/* ------------------------------------------------------------------ */
-
-static objset_t *sa_os = NULL;
-static sa_attr_type_t *sa_attr_table = NULL;
-static char curpath[PATH_MAX];
 
 static int
 open_objset(const char *path, const void *tag, objset_t **osp)
@@ -111,11 +101,9 @@ open_objset(const char *path, const void *tag, objset_t **osp)
 	VERIFY0P(sa_os);
 
 	err = dmu_objset_hold_flags(path, 0, tag, osp);
-	if (err != 0) {
-		(void) fprintf(stderr, "failed to hold dataset '%s': %s\n",
-		    path, strerror(err));
+	if (err != 0)
 		return (err);
-	}
+
 	dsl_dataset_long_hold(dmu_objset_ds(*osp), tag);
 	dsl_pool_rele(dmu_objset_pool(*osp), tag);
 
@@ -129,16 +117,15 @@ open_objset(const char *path, const void *tag, objset_t **osp)
 		err = sa_setup(*osp, sa_attrs, zfs_attr_table, ZPL_END,
 		    &sa_attr_table);
 		if (err != 0) {
-			(void) fprintf(stderr, "sa_setup failed: %s\n",
-			    strerror(err));
 			dsl_dataset_long_rele(dmu_objset_ds(*osp), tag);
 			dsl_dataset_rele_flags(dmu_objset_ds(*osp), 0, tag);
 			*osp = NULL;
+			return (err);
 		}
 	}
-	sa_os = *osp;
 
-	return (err);
+	sa_os = *osp;
+	return (0);
 }
 
 static void
@@ -156,8 +143,7 @@ close_objset(objset_t *os, const void *tag)
 static void
 hash_blkptr_cksum(SHA2_CTX *ctx, const blkptr_t *bp)
 {
-	SHA2Update(ctx, bp->blk_cksum.zc_word,
-	    sizeof (bp->blk_cksum.zc_word));
+	SHA2Update(ctx, bp->blk_cksum.zc_word, sizeof (bp->blk_cksum.zc_word));
 }
 
 static void
@@ -175,7 +161,6 @@ process_leaf_bp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 		ASSERT3U(BP_GET_LEVEL(bp), ==, zb->zb_level);
 	}
 	ASSERT0(zb->zb_level);
-
 	if (BP_IS_EMBEDDED(bp))
 		hash_embedded_bp(ctx, bp);
 	else
@@ -190,47 +175,35 @@ visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
 
 	if (BP_GET_BIRTH(bp) == 0)
 		return (0);
-
 	if (zb->zb_level == 0) {
 		process_leaf_bp(bp, zb, dnp, ctx);
 		return (0);
 	}
-
 	if (BP_GET_LEVEL(bp) > 0 && !BP_IS_HOLE(bp)) {
 		arc_flags_t flags = ARC_FLAG_WAIT;
 		int epb = BP_GET_LSIZE(bp) >> SPA_BLKPTRSHIFT;
 		arc_buf_t *buf;
-		uint64_t fill = 0;
-
-		ASSERT(!BP_IS_REDACTED(bp));
 
 		err = arc_read(NULL, spa, bp, arc_getbuf_func, &buf,
 		    ZIO_PRIORITY_ASYNC_READ, ZIO_FLAG_CANFAIL, &flags, zb);
 		if (err)
 			return (err);
-		ASSERT(buf->b_data);
 
 		blkptr_t *cbp = buf->b_data;
 		for (int i = 0; i < epb; i++, cbp++) {
 			zbookmark_phys_t czb;
-
 			SET_BOOKMARK(&czb, zb->zb_objset, zb->zb_object,
-			    zb->zb_level - 1,
-			    zb->zb_blkid * epb + i);
+			    zb->zb_level - 1, zb->zb_blkid * epb + i);
 			err = visit_indirect(spa, dnp, cbp, &czb, ctx);
 			if (err)
 				break;
-			fill += BP_GET_FILL(cbp);
 		}
-		if (!err)
-			ASSERT3U(fill, ==, BP_GET_FILL(bp));
 		arc_buf_destroy(buf, &buf);
 	}
-
 	return (err);
 }
 
-static void
+static int
 dump_file_hash(dnode_t *dn, unsigned char digest[SHA256_DIGEST_LENGTH])
 {
 	dnode_phys_t *dnp = dn->dn_phys;
@@ -238,7 +211,6 @@ dump_file_hash(dnode_t *dn, unsigned char digest[SHA256_DIGEST_LENGTH])
 	SHA2_CTX ctx;
 
 	SHA2Init(SHA256, &ctx);
-
 	SET_BOOKMARK(&czb, dmu_objset_id(dn->dn_objset),
 	    dn->dn_object, dnp->dn_nlevels - 1, 0);
 	for (int j = 0; j < dnp->dn_nblkptr; j++) {
@@ -246,13 +218,13 @@ dump_file_hash(dnode_t *dn, unsigned char digest[SHA256_DIGEST_LENGTH])
 		int err = visit_indirect(dmu_objset_spa(dn->dn_objset), dnp,
 		    &dnp->dn_blkptr[j], &czb, &ctx);
 		if (err)
-			fatal("visit_indirect failed: %s", strerror(err));
+			return (err);
 	}
-
 	SHA2Final(digest, &ctx);
+	return (0);
 }
 
-static void
+static int
 dump_object(objset_t *os, uint64_t object,
     unsigned char digest[SHA256_DIGEST_LENGTH])
 {
@@ -267,29 +239,27 @@ dump_object(objset_t *os, uint64_t object,
 	} else {
 		error = dmu_object_info(os, object, &doi);
 		if (error)
-			fatal("dmu_object_info() failed, errno %u", error);
-
-		if (os->os_encrypted &&
-		    DMU_OT_IS_ENCRYPTED(doi.doi_bonus_type)) {
+			return (error);
+		if (os->os_encrypted && DMU_OT_IS_ENCRYPTED(doi.doi_bonus_type)) {
 			error = dnode_hold(os, object, FTAG, &dn);
 			if (error)
-				fatal("dnode_hold() failed, errno %u", error);
+				return (error);
 			dnode_held = B_TRUE;
 		} else {
 			error = dmu_bonus_hold(os, object, FTAG, &db);
 			if (error)
-				fatal("dmu_bonus_hold(%llu) failed, errno %u",
-				    (u_longlong_t)object, error);
+				return (error);
 			dn = DB_DNODE((dmu_buf_impl_t *)db);
 		}
 	}
 
-	dump_file_hash(dn, digest);
+	error = dump_file_hash(dn, digest);
 
 	if (db != NULL)
 		dmu_buf_rele(db, FTAG);
 	if (dnode_held)
 		dnode_rele(dn, FTAG);
+	return (error);
 }
 
 static int
@@ -304,35 +274,22 @@ dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
 	if ((s = strchr(name, '/')) != NULL)
 		*s = '\0';
 	err = zap_lookup(os, obj, name, 8, 1, &child_obj);
-
 	(void) strlcat(curpath, name, sizeof (curpath));
-
-	if (err != 0) {
-		(void) fprintf(stderr, "failed to lookup %s: %s\n",
-		    curpath, strerror(err));
+	if (err != 0)
 		return (err);
-	}
 
 	child_obj = ZFS_DIRENT_OBJ(child_obj);
 	err = sa_buf_hold(os, child_obj, FTAG, &db);
-	if (err != 0) {
-		(void) fprintf(stderr,
-		    "failed to get SA dbuf for obj %llu: %s\n",
-		    (u_longlong_t)child_obj, strerror(err));
+	if (err != 0)
 		return (EINVAL);
-	}
 	dmu_object_info_from_db(db, &doi);
 	sa_buf_rele(db, FTAG);
 
 	if (doi.doi_bonus_type != DMU_OT_SA &&
-	    doi.doi_bonus_type != DMU_OT_ZNODE) {
-		(void) fprintf(stderr, "invalid bonus type %d for obj %llu\n",
-		    doi.doi_bonus_type, (u_longlong_t)child_obj);
+	    doi.doi_bonus_type != DMU_OT_ZNODE)
 		return (EINVAL);
-	}
 
 	(void) strlcat(curpath, "/", sizeof (curpath));
-
 	switch (doi.doi_type) {
 	case DMU_OT_DIRECTORY_CONTENTS:
 		if (s != NULL && *(s + 1) != '\0')
@@ -342,12 +299,8 @@ dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
 		*retobj = child_obj;
 		return (0);
 	default:
-		(void) fprintf(stderr, "object %llu has non-file/directory "
-		    "type %d\n", (u_longlong_t)obj, doi.doi_type);
-		break;
+		return (EINVAL);
 	}
-
-	return (EINVAL);
 }
 
 static int
@@ -362,99 +315,121 @@ hash_path_from_root(objset_t *os, uint64_t root_obj,
 	(void) snprintf(curpath, sizeof (curpath), "dataset=%s path=/", ds);
 	path_copy = strdup(path);
 	if (path_copy == NULL)
-		fatal("out of memory while duplicating path");
-
+		return (ENOMEM);
 	err = dump_path_impl(os, root_obj, path_copy, &object);
 	free(path_copy);
 	if (err != 0)
 		return (err);
-
-	dump_object(os, object, digest);
-	return (0);
+	return (dump_object(os, object, digest));
 }
 
 static void
-print_digest(const unsigned char digest[SHA256_DIGEST_LENGTH],
-    const char *path, int include_path)
+digest_to_hex(const unsigned char digest[SHA256_DIGEST_LENGTH], char *out)
 {
 	for (unsigned int i = 0; i < SHA256_DIGEST_LENGTH; i++)
-		(void) printf("%02x", digest[i]);
-
-	if (include_path)
-		(void) printf("  %s", path);
-	(void) printf("\n");
+		(void) snprintf(&out[i * 2], 3, "%02x", digest[i]);
+	out[SHA256_DIGEST_LENGTH * 2] = '\0';
 }
 
 static int
-run_local(int argc, char **argv, int optidx)
+read_line(FILE *fp, char *buf, size_t bufsz)
 {
-	char *spa_config_path_env;
-	objset_t *os = NULL;
-	uint64_t root_obj;
-	int include_path;
-	int ret = 0;
-	char *dataset;
-
-	if (optidx + 2 > argc)
-		usage();
-
-	dataset = argv[optidx++];
-	include_path = ((argc - optidx) > 1);
-
-	spa_config_path_env = getenv("SPA_CONFIG_PATH");
-	if (spa_config_path_env != NULL)
-		spa_config_path = spa_config_path_env;
-
-	zfs_btree_verify_intensity = 3;
-
-#if defined(_LP64)
-	zfs_arc_min = 2ULL << SPA_MAXBLOCKSHIFT;
-	zfs_arc_max = 256 * 1024 * 1024;
-#endif
-
-	zfs_vdev_async_read_max_active = 10;
-	reference_tracking_enable = B_FALSE;
-	spa_load_verify_dryrun = B_TRUE;
-	spa_mode_readable_spacemaps = B_TRUE;
-
-	kernel_init(SPA_MODE_READ);
-
-	ret = open_objset(dataset, FTAG, &os);
-	if (ret != 0)
-		goto out;
-
-	ret = zap_lookup(os, MASTER_NODE_OBJ, ZFS_ROOT_OBJ, 8, 1, &root_obj);
-	if (ret != 0) {
-		(void) fprintf(stderr, "can't lookup root znode: %s\n",
-		    strerror(ret));
-		ret = EINVAL;
-		goto out;
-	}
-
-	for (int i = optidx; i < argc; i++) {
-		unsigned char digest[SHA256_DIGEST_LENGTH];
-
-		ret = hash_path_from_root(os, root_obj, dataset,
-		    argv[i], digest);
-		if (ret != 0)
-			goto out;
-
-		print_digest(digest, argv[i], include_path);
-	}
-
-out:
-	if (os != NULL)
-		close_objset(os, FTAG);
-	kernel_fini();
-	return (ret);
+	if (fgets(buf, bufsz, fp) == NULL)
+		return (errno == 0 ? EOF : errno);
+	size_t len = strlen(buf);
+	if (len > 0 && buf[len - 1] == '\n')
+		buf[len - 1] = '\0';
+	return (0);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Server (socket client) mode                                       */
-/* ------------------------------------------------------------------ */
+static int
+send_err(FILE *fp, const char *msg)
+{
+	if (fprintf(fp, "ERR %s\n", msg) < 0)
+		return (EIO);
+	if (fflush(fp) != 0)
+		return (EIO);
+	return (0);
+}
 
 static int
-connect_socket(const char *sock_path)
+serve_client(int fd, objset_t **cached_os, char *cached_ds, size_t cached_ds_sz,
+    uint64_t *cached_root_obj)
+{
+	FILE *fp = fdopen(fd, "r+");
+	char line[8192];
+	if (fp == NULL)
+		return (errno);
+
+	while (1) {
+		char *tab;
+		char *ds;
+		char *path;
+		unsigned char digest[SHA256_DIGEST_LENGTH];
+		char hex[(SHA256_DIGEST_LENGTH * 2) + 1];
+		int err;
+
+		err = read_line(fp, line, sizeof (line));
+		if (err == EOF)
+			break;
+		if (err != 0 || line[0] == '\0') {
+			(void) send_err(fp, "invalid request");
+			continue;
+		}
+
+		tab = strchr(line, '\t');
+		if (tab == NULL) {
+			(void) send_err(fp, "expected dataset<TAB>path");
+			continue;
+		}
+		*tab = '\0';
+		ds = line;
+		path = tab + 1;
+		if (ds[0] == '\0' || path[0] == '\0') {
+			(void) send_err(fp, "empty dataset or path");
+			continue;
+		}
+
+		if (*cached_os == NULL || strcmp(cached_ds, ds) != 0) {
+			if (*cached_os != NULL) {
+				close_objset(*cached_os, FTAG);
+				*cached_os = NULL;
+			}
+			err = open_objset(ds, FTAG, cached_os);
+			if (err != 0) {
+				(void) send_err(fp, strerror(err));
+				continue;
+			}
+			err = zap_lookup(*cached_os, MASTER_NODE_OBJ, ZFS_ROOT_OBJ,
+			    8, 1, cached_root_obj);
+			if (err != 0) {
+				(void) send_err(fp, "can't lookup root znode");
+				close_objset(*cached_os, FTAG);
+				*cached_os = NULL;
+				continue;
+			}
+			(void) strlcpy(cached_ds, ds, cached_ds_sz);
+		}
+
+		err = hash_path_from_root(*cached_os, *cached_root_obj, ds, path, digest);
+		if (err != 0) {
+			(void) send_err(fp, strerror(err));
+			continue;
+		}
+
+		digest_to_hex(digest, hex);
+		if (fprintf(fp, "OK %s\n", hex) < 0)
+			break;
+		if (fflush(fp) != 0)
+			break;
+	}
+
+	(void) fclose(fp);
+	return (0);
+}
+
+static int
+create_server_socket(const char *sock_path)
 {
 	int fd;
 	struct sockaddr_un addr = { 0 };
@@ -462,97 +437,37 @@ connect_socket(const char *sock_path)
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return (-1);
+
+	(void) unlink(sock_path);
 	addr.sun_family = AF_UNIX;
 	(void) strlcpy(addr.sun_path, sock_path, sizeof (addr.sun_path));
-	if (connect(fd, (struct sockaddr *)&addr, sizeof (addr)) != 0) {
+	if (bind(fd, (struct sockaddr *)&addr, sizeof (addr)) != 0) {
+		(void) close(fd);
+		return (-1);
+	}
+	if (listen(fd, 32) != 0) {
 		(void) close(fd);
 		return (-1);
 	}
 	return (fd);
 }
 
-static int
-run_server(int argc, char **argv, int optidx, const char *sock_path)
-{
-	char *dataset;
-	int include_path;
-	int fd;
-	FILE *fp;
-
-	if (optidx + 2 > argc)
-		usage();
-
-	dataset = argv[optidx++];
-	include_path = ((argc - optidx) > 1);
-
-	fd = connect_socket(sock_path);
-	if (fd < 0) {
-		fatal("failed to connect %s: %s (is zfssum-server running?)",
-		    sock_path, strerror(errno));
-	}
-	fp = fdopen(fd, "r+");
-	if (fp == NULL) {
-		(void) close(fd);
-		fatal("fdopen failed: %s", strerror(errno));
-	}
-
-	for (int i = optidx; i < argc; i++) {
-		char line[4096];
-		char *status;
-		char *payload;
-		char *nl;
-		const char *path = argv[i];
-
-		if (fprintf(fp, "%s\t%s\n", dataset, path) < 0 ||
-		    fflush(fp) != 0) {
-			(void) fclose(fp);
-			fatal("socket write failed: %s", strerror(errno));
-		}
-
-		if (fgets(line, sizeof (line), fp) == NULL) {
-			(void) fclose(fp);
-			fatal("socket read failed: %s", strerror(errno));
-		}
-		nl = strchr(line, '\n');
-		if (nl != NULL)
-			*nl = '\0';
-
-		status = strtok(line, " ");
-		payload = strtok(NULL, "");
-		if (status == NULL || payload == NULL) {
-			(void) fclose(fp);
-			fatal("malformed server response");
-		}
-		if (strcmp(status, "OK") != 0) {
-			(void) fclose(fp);
-			fatal("server error for %s: %s", path, payload);
-		}
-
-		if (include_path)
-			(void) printf("%s  %s\n", payload, path);
-		else
-			(void) printf("%s\n", payload);
-	}
-
-	(void) fclose(fp);
-	return (0);
-}
-
-/* ------------------------------------------------------------------ */
-/*  main                                                              */
-/* ------------------------------------------------------------------ */
-
 int
 main(int argc, char **argv)
 {
 	const char *sock_path = "/var/run/zfssum.sock";
-	boolean_t local_mode = B_FALSE;
+	boolean_t daemonize = B_FALSE;
+	char *spa_config_path_env;
 	int c;
+	int srv_fd;
+	objset_t *cached_os = NULL;
+	char cached_ds[ZFS_MAX_DATASET_NAME_LEN];
+	uint64_t cached_root_obj = 0;
 
-	while ((c = getopt(argc, argv, "ls:")) != -1) {
+	while ((c = getopt(argc, argv, "ds:")) != -1) {
 		switch (c) {
-		case 'l':
-			local_mode = B_TRUE;
+		case 'd':
+			daemonize = B_TRUE;
 			break;
 		case 's':
 			sock_path = optarg;
@@ -561,9 +476,51 @@ main(int argc, char **argv)
 			usage();
 		}
 	}
+	if (optind != argc)
+		usage();
 
-	if (local_mode)
-		return (run_local(argc, argv, optind));
-	else
-		return (run_server(argc, argv, optind, sock_path));
+	spa_config_path_env = getenv("SPA_CONFIG_PATH");
+	if (spa_config_path_env != NULL)
+		spa_config_path = spa_config_path_env;
+
+	zfs_btree_verify_intensity = 3;
+#if defined(_LP64)
+	zfs_arc_min = 2ULL << SPA_MAXBLOCKSHIFT;
+	zfs_arc_max = 256 * 1024 * 1024;
+#endif
+	zfs_vdev_async_read_max_active = 10;
+	reference_tracking_enable = B_FALSE;
+	spa_load_verify_dryrun = B_TRUE;
+	spa_mode_readable_spacemaps = B_TRUE;
+
+	kernel_init(SPA_MODE_READ);
+
+	srv_fd = create_server_socket(sock_path);
+	if (srv_fd < 0)
+		fatal("failed to create server socket %s: %s",
+		    sock_path, strerror(errno));
+
+	if (daemonize) {
+		if (daemon(0, 0) != 0)
+			fatal("daemon() failed: %s", strerror(errno));
+	}
+
+	(void) memset(cached_ds, 0, sizeof (cached_ds));
+	while (1) {
+		int cfd = accept(srv_fd, NULL, NULL);
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		(void) serve_client(cfd, &cached_os, cached_ds, sizeof (cached_ds),
+		    &cached_root_obj);
+	}
+
+	if (cached_os != NULL)
+		close_objset(cached_os, FTAG);
+	(void) close(srv_fd);
+	(void) unlink(sock_path);
+	kernel_fini();
+	return (0);
 }
