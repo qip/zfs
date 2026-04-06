@@ -39,6 +39,20 @@ zhack_LDADD = \
 	libnvpair.la \
 	librange_tree.la
 
+
+zfssum_CPPFLAGS = $(AM_CPPFLAGS) $(LIBZPOOL_CPPFLAGS)
+
+sbin_PROGRAMS   += zfssum
+CPPCHECKTARGETS += zfssum
+
+zfssum_SOURCES = \
+	%D%/zfssum.c
+
+zfssum_LDADD = \
+	libzpool.la \
+	libzfs_core.la \
+	libnvpair.la
+
 ztest_CFLAGS    = $(AM_CFLAGS) $(KERNEL_CFLAGS)
 ztest_CPPFLAGS  = $(AM_CPPFLAGS) $(LIBZPOOL_CPPFLAGS)
 
