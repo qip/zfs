@@ -66,6 +66,19 @@ zfssum_server_LDADD = \
 	libzfs_core.la \
 	libnvpair.la
 
+zfssum_update_CPPFLAGS = $(AM_CPPFLAGS) $(LIBZPOOL_CPPFLAGS)
+
+sbin_PROGRAMS   += zfssum-update
+CPPCHECKTARGETS += zfssum-update
+
+zfssum_update_SOURCES = \
+	%D%/zfssum_update.c
+
+zfssum_update_LDADD = \
+	libzpool.la \
+	libzfs_core.la \
+	libnvpair.la
+
 ztest_CFLAGS    = $(AM_CFLAGS) $(KERNEL_CFLAGS)
 ztest_CPPFLAGS  = $(AM_CPPFLAGS) $(LIBZPOOL_CPPFLAGS)
 

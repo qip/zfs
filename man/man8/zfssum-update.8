@@ -1,0 +1,172 @@
+.\" SPDX-License-Identifier: CDDL-1.0
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.Dd April 8, 2026
+.Dt ZFSSUM-UPDATE 8
+.Os
+.
+.Sh NAME
+.Nm zfssum-update
+.Nd update zfssum xattrs for every file in a ZFS dataset
+.
+.Sh SYNOPSIS
+.Nm
+.Op Fl a Ar algo
+.Op Fl S
+.Op Fl Z
+.Op Fl v
+.Op Fl -update
+.Ar dataset
+.Op Ar mountpoint
+.
+.Sh DESCRIPTION
+.Nm
+computes
+.Xr zfssum 8
+checksums for every regular file in
+.Ar dataset
+and stores the results as extended attributes on the mounted filesystem.
+.Pp
+Two xattrs are written per file:
+.Bl -tag -width "user.zfssum.checksum"
+.It Li user.zfssum.checksum
+The hex-encoded digest.
+.It Li user.zfssum.meta
+A semicolon-separated string recording the algorithm, options, file
+modification time
+.Pq nanosecond precision ,
+and file size at the time the checksum was computed.
+Format:
+.Li alg=blake3,size,holefill;mtime=1712345678.123456789;size=12345 .
+.El
+.Pp
+The tool operates in two phases:
+.Bl -enum
+.It
+.Sy "ZAP directory walk" :
+the dataset's directory tree is traversed at the DMU level using
+ZAP cursor APIs, building an in-memory mapping from object number to
+relative path.
+No VFS transitions occur during this phase.
+.It
+.Sy "Sequential object iteration" :
+all objects in the dataset are visited in object-number order via
+.Fn dmu_object_next .
+For each regular file the block pointer checksum is computed and both
+xattrs are written via
+.Xr lsetxattr 2 .
+Because dnode blocks hold approximately 32 adjacent dnodes,
+sequential iteration maximizes ARC hit rates.
+.El
+.Pp
+.Ar mountpoint
+is required for xattr writes.
+If omitted,
+.Nm
+reads
+.Pa /proc/self/mounts
+to find the ZFS mount for
+.Ar dataset .
+.
+.Sh OPTIONS
+.Bl -tag -width "--skip-holes"
+.It Fl a , -algo Ar algo
+Hash algorithm used to combine block checksums.
+Supported values:
+.Cm blake3
+.Pq default ,
+.Cm sha256 ,
+.Cm sha512 ,
+.Cm bp .
+See
+.Xr zfssum 8
+for details on each algorithm.
+.It Fl S , -no-size
+Do
+.Em not
+include the file size in the hash.
+.It Fl Z , -skip-holes
+Skip holes instead of filling zeros.
+.It Fl v , -verbose
+Print per-file hex digest and timing to standard error.
+.It Fl -update
+Before computing a checksum, read the file's existing
+.Li user.zfssum.meta
+from the SA xattr nvlist
+.Pq at the DMU level, without a VFS call .
+If the recorded algorithm, modification time, and file size all match the
+current values, the file is skipped.
+.Pp
+Without
+.Fl -update ,
+checksums are computed for all files unconditionally and all xattrs are
+overwritten.
+.El
+.
+.Sh DIAGNOSTICS
+Progress is printed to standard error once per second:
+.Bd -literal -offset indent
+[00:01:23] 12345/67890 files (18.2%) | 234.5 files/s | errors: 3
+.Ed
+.Pp
+With
+.Fl -update ,
+a cached count is also shown.
+On completion a summary line is printed:
+.Bd -literal -offset indent
+done: 67890 files, 12345 checksummed, 55545 cached, 0 errors in 1m23s
+.Ed
+.
+.Sh EXAMPLES
+Compute checksums for every file in
+.Li tank/data :
+.Bd -literal -offset indent
+# zfssum-update tank/data
+.Ed
+.Pp
+Incremental update after a few files have changed:
+.Bd -literal -offset indent
+# zfssum-update --update tank/data
+.Ed
+.Pp
+Use SHA-256 and specify the mountpoint explicitly:
+.Bd -literal -offset indent
+# zfssum-update -a sha256 tank/data /tank/data
+.Ed
+.
+.Sh CAVEATS
+The
+.Fl -update
+cache check reads the
+.Li ZPL_DXATTR
+SA attribute.
+On datasets with
+.Sy xattr Ns = Ns Cm dir ,
+xattrs are not stored in SA and the cache check always reports a miss,
+causing all files to be recomputed.
+.Sy xattr Ns = Ns Cm sa
+.Pq the default
+is recommended.
+.Pp
+.Nm
+opens the pool in read-only mode via
+.Sy libzpool .
+The pool must also be imported by the running kernel so that
+.Xr lsetxattr 2
+can write xattrs through VFS.
+.Pp
+Encrypted datasets are not supported because SA attributes are not
+readable from userspace.
+.
+.Sh SEE ALSO
+.Xr lsetxattr 2 ,
+.Xr zfssum 8 ,
+.Xr zfs 8

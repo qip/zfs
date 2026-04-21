@@ -43,6 +43,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <pthread.h>
 
 #include <sys/zfs_context.h>
 #include <sys/spa.h>
@@ -203,9 +204,6 @@ parse_opts(const char *str, zfssum_opts_t *opts)
 /* ------------------------------------------------------------------ */
 
 static const char cmdname[] = "zfssum-server";
-static char curpath[PATH_MAX];
-static objset_t *sa_os = NULL;
-static sa_attr_type_t *sa_attr_table = NULL;
 
 static void __attribute__((noreturn))
 fatal(const char *fmt, ...)
@@ -224,10 +222,13 @@ static void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "usage: %s [-d] [-s socket] [-m mode]"
+	    "usage: %s [-d] [-v] [-j jobs] [-s socket] [-m mode]"
 	    " [-u uid] [-g gid]\n\n", cmdname);
 	(void) fprintf(stderr,
 	    "  -d, --daemon       daemonize after startup\n"
+	    "  -j, --jobs N       worker threads"
+	    " (default: 4)\n"
+	    "  -v, --verbose      per-request timing to stderr\n"
 	    "  -s, --socket PATH  server socket"
 	    " (default: /var/run/zfssum.sock)\n"
 	    "  -m, --mode MODE    socket permission mode"
@@ -238,13 +239,12 @@ usage(void)
 }
 
 static int
-open_objset(const char *path, const void *tag, objset_t **osp)
+open_objset(const char *path, const void *tag, objset_t **osp,
+    sa_attr_type_t **sa_table)
 {
 	int err;
 	uint64_t sa_attrs = 0;
 	uint64_t version = 0;
-
-	VERIFY0P(sa_os);
 
 	err = dmu_objset_hold_flags(path, 0, tag, osp);
 	if (err != 0)
@@ -253,6 +253,7 @@ open_objset(const char *path, const void *tag, objset_t **osp)
 	dsl_dataset_long_hold(dmu_objset_ds(*osp), tag);
 	dsl_pool_rele(dmu_objset_pool(*osp), tag);
 
+	*sa_table = NULL;
 	if (dmu_objset_type(*osp) == DMU_OST_ZFS && !(*osp)->os_encrypted) {
 		(void) zap_lookup(*osp, MASTER_NODE_OBJ, ZPL_VERSION_STR,
 		    8, 1, &version);
@@ -261,7 +262,7 @@ open_objset(const char *path, const void *tag, objset_t **osp)
 			    8, 1, &sa_attrs);
 		}
 		err = sa_setup(*osp, sa_attrs, zfs_attr_table, ZPL_END,
-		    &sa_attr_table);
+		    sa_table);
 		if (err != 0) {
 			dsl_dataset_long_rele(dmu_objset_ds(*osp), tag);
 			dsl_dataset_rele_flags(dmu_objset_ds(*osp), 0, tag);
@@ -270,32 +271,28 @@ open_objset(const char *path, const void *tag, objset_t **osp)
 		}
 	}
 
-	sa_os = *osp;
 	return (0);
 }
 
 static void
 close_objset(objset_t *os, const void *tag)
 {
-	VERIFY3P(os, ==, sa_os);
 	if (os->os_sa != NULL)
 		sa_tear_down(os);
 	dsl_dataset_long_rele(dmu_objset_ds(os), tag);
 	dsl_dataset_rele_flags(dmu_objset_ds(os), 0, tag);
-	sa_attr_table = NULL;
-	sa_os = NULL;
 }
 
 static uint64_t
-get_file_size(objset_t *os, uint64_t object)
+get_file_size(objset_t *os, uint64_t object, sa_attr_type_t *sa_table)
 {
 	uint64_t size = 0;
 	sa_handle_t *hdl;
 
-	if (object == 0 || sa_attr_table == NULL)
+	if (object == 0 || sa_table == NULL)
 		return (0);
 	if (sa_handle_get(os, object, NULL, SA_HDL_PRIVATE, &hdl) == 0) {
-		(void) sa_lookup(hdl, sa_attr_table[ZPL_SIZE],
+		(void) sa_lookup(hdl, sa_table[ZPL_SIZE],
 		    &size, sizeof (size));
 		sa_handle_destroy(hdl);
 	}
@@ -456,7 +453,8 @@ dump_file_bp_hash(dnode_t *dn, unsigned char *digest, unsigned *digest_len)
 
 static int
 dump_object(objset_t *os, uint64_t object,
-    const zfssum_opts_t *opts, unsigned char *digest, unsigned *digest_len)
+    const zfssum_opts_t *opts, sa_attr_type_t *sa_table,
+    unsigned char *digest, unsigned *digest_len)
 {
 	dmu_buf_t *db = NULL;
 	dmu_object_info_t doi;
@@ -486,7 +484,7 @@ dump_object(objset_t *os, uint64_t object,
 	}
 
 	if (opts->include_size && opts->algo != HASH_BP)
-		file_size = get_file_size(os, object);
+		file_size = get_file_size(os, object, sa_table);
 
 	if (opts->algo == HASH_BP)
 		error = dump_file_bp_hash(dn, digest, digest_len);
@@ -502,7 +500,8 @@ dump_object(objset_t *os, uint64_t object,
 }
 
 static int
-dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
+dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj,
+    char *curpath, size_t curpath_sz)
 {
 	int err;
 	uint64_t child_obj;
@@ -513,7 +512,7 @@ dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
 	if ((s = strchr(name, '/')) != NULL)
 		*s = '\0';
 	err = zap_lookup(os, obj, name, 8, 1, &child_obj);
-	(void) strlcat(curpath, name, sizeof (curpath));
+	(void) strlcat(curpath, name, curpath_sz);
 	if (err != 0)
 		return (err);
 
@@ -528,11 +527,12 @@ dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
 	    doi.doi_bonus_type != DMU_OT_ZNODE)
 		return (EINVAL);
 
-	(void) strlcat(curpath, "/", sizeof (curpath));
+	(void) strlcat(curpath, "/", curpath_sz);
 	switch (doi.doi_type) {
 	case DMU_OT_DIRECTORY_CONTENTS:
 		if (s != NULL && *(s + 1) != '\0')
-			return (dump_path_impl(os, child_obj, s + 1, retobj));
+			return (dump_path_impl(os, child_obj, s + 1, retobj,
+			    curpath, curpath_sz));
 		zfs_fallthrough;
 	case DMU_OT_PLAIN_FILE_CONTENTS:
 		*retobj = child_obj;
@@ -540,26 +540,6 @@ dump_path_impl(objset_t *os, uint64_t obj, char *name, uint64_t *retobj)
 	default:
 		return (EINVAL);
 	}
-}
-
-static int
-hash_path_from_root(objset_t *os, uint64_t root_obj,
-    const char *ds, const char *path, const zfssum_opts_t *opts,
-    unsigned char *digest, unsigned *digest_len)
-{
-	int err;
-	uint64_t object;
-	char *path_copy;
-
-	(void) snprintf(curpath, sizeof (curpath), "dataset=%s path=/", ds);
-	path_copy = strdup(path);
-	if (path_copy == NULL)
-		return (ENOMEM);
-	err = dump_path_impl(os, root_obj, path_copy, &object);
-	free(path_copy);
-	if (err != 0)
-		return (err);
-	return (dump_object(os, object, opts, digest, digest_len));
 }
 
 static void
@@ -593,10 +573,13 @@ send_err(FILE *fp, const char *msg)
 
 static int
 serve_client(int fd, objset_t **cached_os, char *cached_ds, size_t cached_ds_sz,
-    uint64_t *cached_root_obj)
+    uint64_t *cached_root_obj, sa_attr_type_t **cached_sa_table,
+    int worker_id, boolean_t verbose)
 {
 	FILE *fp = fdopen(fd, "r+");
 	char line[8192];
+	uint64_t nreqs = 0;
+	hrtime_t sum_resolve = 0, sum_hash = 0;
 	if (fp == NULL)
 		return (errno);
 
@@ -609,6 +592,10 @@ serve_client(int fd, objset_t **cached_os, char *cached_ds, size_t cached_ds_sz,
 		char hex[MAX_HEX_LEN];
 		int err;
 		zfssum_opts_t opts = default_opts;
+		uint64_t object;
+		char curpath[PATH_MAX];
+		char *path_copy;
+		hrtime_t t0, t1, t2;
 
 		err = read_line(fp, line, sizeof (line));
 		if (err == EOF)
@@ -648,8 +635,10 @@ serve_client(int fd, objset_t **cached_os, char *cached_ds, size_t cached_ds_sz,
 			if (*cached_os != NULL) {
 				close_objset(*cached_os, FTAG);
 				*cached_os = NULL;
+				*cached_sa_table = NULL;
 			}
-			err = open_objset(ds, FTAG, cached_os);
+			err = open_objset(ds, FTAG, cached_os,
+			    cached_sa_table);
 			if (err != 0) {
 				(void) send_err(fp, strerror(err));
 				continue;
@@ -660,13 +649,34 @@ serve_client(int fd, objset_t **cached_os, char *cached_ds, size_t cached_ds_sz,
 				(void) send_err(fp, "can't lookup root znode");
 				close_objset(*cached_os, FTAG);
 				*cached_os = NULL;
+				*cached_sa_table = NULL;
 				continue;
 			}
 			(void) strlcpy(cached_ds, ds, cached_ds_sz);
 		}
 
-		err = hash_path_from_root(*cached_os, *cached_root_obj,
-		    ds, path, &opts, digest, &digest_len);
+		t0 = gethrtime();
+
+		(void) snprintf(curpath, sizeof (curpath),
+		    "dataset=%s path=/", ds);
+		path_copy = strdup(path);
+		if (path_copy == NULL) {
+			(void) send_err(fp, strerror(ENOMEM));
+			continue;
+		}
+		err = dump_path_impl(*cached_os, *cached_root_obj,
+		    path_copy, &object, curpath, sizeof (curpath));
+		free(path_copy);
+
+		t1 = gethrtime();
+
+		if (err == 0) {
+			err = dump_object(*cached_os, object, &opts,
+			    *cached_sa_table, digest, &digest_len);
+		}
+
+		t2 = gethrtime();
+
 		if (err != 0) {
 			(void) send_err(fp, strerror(err));
 			continue;
@@ -677,6 +687,27 @@ serve_client(int fd, objset_t **cached_os, char *cached_ds, size_t cached_ds_sz,
 			break;
 		if (fflush(fp) != 0)
 			break;
+
+		nreqs++;
+		if (verbose) {
+			sum_resolve += t1 - t0;
+			sum_hash += t2 - t1;
+			(void) fprintf(stderr,
+			    "[W%d #%llu] %s "
+			    "resolve=%.3fms hash=%.3fms\n",
+			    worker_id, (u_longlong_t)nreqs, path,
+			    (double)(t1 - t0) / 1000000,
+			    (double)(t2 - t1) / 1000000);
+		}
+	}
+
+	if (verbose && nreqs > 0) {
+		(void) fprintf(stderr,
+		    "[W%d] done: %llu reqs "
+		    "avg_resolve=%.3fms avg_hash=%.3fms\n",
+		    worker_id, (u_longlong_t)nreqs,
+		    (double)sum_resolve / nreqs / 1000000,
+		    (double)sum_hash / nreqs / 1000000);
 	}
 
 	(void) fclose(fp);
@@ -717,6 +748,38 @@ create_server_socket(const char *sock_path, mode_t mode,
 	return (fd);
 }
 
+typedef struct {
+	int srv_fd;
+	int id;
+	boolean_t verbose;
+} worker_arg_t;
+
+static void *
+worker_thread(void *arg)
+{
+	worker_arg_t *wa = arg;
+	objset_t *cached_os = NULL;
+	char cached_ds[ZFS_MAX_DATASET_NAME_LEN] = { 0 };
+	uint64_t cached_root_obj = 0;
+	sa_attr_type_t *cached_sa_table = NULL;
+
+	while (1) {
+		int cfd = accept(wa->srv_fd, NULL, NULL);
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		(void) serve_client(cfd, &cached_os, cached_ds,
+		    sizeof (cached_ds), &cached_root_obj,
+		    &cached_sa_table, wa->id, wa->verbose);
+	}
+
+	if (cached_os != NULL)
+		close_objset(cached_os, FTAG);
+	return (NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -728,9 +791,8 @@ main(int argc, char **argv)
 	char *spa_config_path_env;
 	int c;
 	int srv_fd;
-	objset_t *cached_os = NULL;
-	char cached_ds[ZFS_MAX_DATASET_NAME_LEN];
-	uint64_t cached_root_obj = 0;
+	int nworkers = 4;
+	boolean_t verbose = B_FALSE;
 
 	static struct option long_options[] = {
 		{"daemon",	no_argument,		NULL, 'd'},
@@ -738,10 +800,12 @@ main(int argc, char **argv)
 		{"mode",	required_argument,	NULL, 'm'},
 		{"uid",		required_argument,	NULL, 'u'},
 		{"gid",		required_argument,	NULL, 'g'},
+		{"jobs",	required_argument,	NULL, 'j'},
+		{"verbose",	no_argument,		NULL, 'v'},
 		{0, 0, 0, 0}
 	};
 
-	while ((c = getopt_long(argc, argv, "dg:m:s:u:",
+	while ((c = getopt_long(argc, argv, "dg:j:m:s:u:v",
 	    long_options, NULL)) != -1) {
 		switch (c) {
 		case 'd':
@@ -749,6 +813,11 @@ main(int argc, char **argv)
 			break;
 		case 'g':
 			sock_gid = (gid_t)strtol(optarg, NULL, 10);
+			break;
+		case 'j':
+			nworkers = (int)strtol(optarg, NULL, 10);
+			if (nworkers < 1)
+				nworkers = 1;
 			break;
 		case 'm':
 			sock_mode = (mode_t)strtol(optarg, NULL, 8);
@@ -758,6 +827,9 @@ main(int argc, char **argv)
 			break;
 		case 'u':
 			sock_uid = (uid_t)strtol(optarg, NULL, 10);
+			break;
+		case 'v':
+			verbose = B_TRUE;
 			break;
 		default:
 			usage();
@@ -792,20 +864,28 @@ main(int argc, char **argv)
 			fatal("daemon() failed: %s", strerror(errno));
 	}
 
-	(void) memset(cached_ds, 0, sizeof (cached_ds));
-	while (1) {
-		int cfd = accept(srv_fd, NULL, NULL);
-		if (cfd < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		(void) serve_client(cfd, &cached_os, cached_ds,
-		    sizeof (cached_ds), &cached_root_obj);
+	pthread_t *tids = calloc(nworkers, sizeof (pthread_t));
+	if (tids == NULL)
+		fatal("calloc: %s", strerror(errno));
+
+	worker_arg_t *wa = calloc(nworkers, sizeof (*wa));
+	if (wa == NULL)
+		fatal("calloc: %s", strerror(errno));
+	for (int i = 0; i < nworkers; i++) {
+		wa[i].srv_fd = srv_fd;
+		wa[i].id = i;
+		wa[i].verbose = verbose;
+		int err = pthread_create(&tids[i], NULL,
+		    worker_thread, &wa[i]);
+		if (err != 0)
+			fatal("pthread_create: %s", strerror(err));
 	}
 
-	if (cached_os != NULL)
-		close_objset(cached_os, FTAG);
+	for (int i = 0; i < nworkers; i++)
+		(void) pthread_join(tids[i], NULL);
+
+	free(wa);
+	free(tids);
 	(void) close(srv_fd);
 	(void) unlink(sock_path);
 	kernel_fini();

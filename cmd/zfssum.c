@@ -692,21 +692,32 @@ connect_socket(const char *sock_path)
 	return (fd);
 }
 
+/*
+ * Keep up to this many requests in flight to hide per-request
+ * round-trip latency on the Unix socket.
+ */
+#define	PIPELINE_DEPTH	128
+
 static int
 run_server(int argc, char **argv, int optidx, const char *sock_path,
     const zfssum_opts_t *opts)
 {
 	char *dataset;
 	int include_path;
-	int fd;
-	FILE *fp;
+	int fd, rfd;
+	FILE *wfp, *rfp;
 	char opts_str[64];
+	int nfiles, sent, recvd;
+	char line[4096];
+	char *status, *payload, *nl;
+	const char *path;
 
 	if (optidx + 2 > argc)
 		usage();
 
 	dataset = argv[optidx++];
-	include_path = ((argc - optidx) > 1);
+	nfiles = argc - optidx;
+	include_path = (nfiles > 1);
 	opts_to_str(opts, opts_str, sizeof (opts_str));
 
 	fd = connect_socket(sock_path);
@@ -714,29 +725,49 @@ run_server(int argc, char **argv, int optidx, const char *sock_path,
 		fatal("failed to connect %s: %s (is zfssum-server running?)",
 		    sock_path, strerror(errno));
 	}
-	fp = fdopen(fd, "r+");
-	if (fp == NULL) {
+
+	rfd = dup(fd);
+	if (rfd < 0) {
 		(void) close(fd);
+		fatal("dup failed: %s", strerror(errno));
+	}
+	wfp = fdopen(fd, "w");
+	rfp = fdopen(rfd, "r");
+	if (wfp == NULL || rfp == NULL) {
+		if (wfp != NULL)
+			(void) fclose(wfp);
+		else
+			(void) close(fd);
+		if (rfp != NULL)
+			(void) fclose(rfp);
+		else
+			(void) close(rfd);
 		fatal("fdopen failed: %s", strerror(errno));
 	}
 
-	for (int i = optidx; i < argc; i++) {
-		char line[4096];
-		char *status;
-		char *payload;
-		char *nl;
-		const char *path = argv[i];
-
-		if (fprintf(fp, "%s\t%s\t%s\n",
-		    dataset, path, opts_str) < 0 ||
-		    fflush(fp) != 0) {
-			(void) fclose(fp);
-			fatal("socket write failed: %s", strerror(errno));
+	for (sent = 0, recvd = 0; recvd < nfiles; recvd++) {
+		while (sent < nfiles && sent - recvd < PIPELINE_DEPTH) {
+			if (fprintf(wfp, "%s\t%s\t%s\n",
+			    dataset, argv[optidx + sent], opts_str) < 0) {
+				(void) fclose(wfp);
+				(void) fclose(rfp);
+				fatal("write failed: %s", strerror(errno));
+			}
+			sent++;
+		}
+		if (fflush(wfp) != 0) {
+			(void) fclose(wfp);
+			(void) fclose(rfp);
+			fatal("flush failed: %s", strerror(errno));
 		}
 
-		if (fgets(line, sizeof (line), fp) == NULL) {
-			(void) fclose(fp);
-			fatal("socket read failed: %s", strerror(errno));
+		path = argv[optidx + recvd];
+
+		if (fgets(line, sizeof (line), rfp) == NULL) {
+			(void) fclose(wfp);
+			(void) fclose(rfp);
+			fatal("read failed for %s: %s",
+			    path, strerror(errno));
 		}
 		nl = strchr(line, '\n');
 		if (nl != NULL)
@@ -745,11 +776,13 @@ run_server(int argc, char **argv, int optidx, const char *sock_path,
 		status = strtok(line, " ");
 		payload = strtok(NULL, "");
 		if (status == NULL || payload == NULL) {
-			(void) fclose(fp);
+			(void) fclose(wfp);
+			(void) fclose(rfp);
 			fatal("malformed server response");
 		}
 		if (strcmp(status, "OK") != 0) {
-			(void) fclose(fp);
+			(void) fclose(wfp);
+			(void) fclose(rfp);
 			fatal("server error for %s: %s", path, payload);
 		}
 
@@ -759,7 +792,8 @@ run_server(int argc, char **argv, int optidx, const char *sock_path,
 			(void) printf("%s\n", payload);
 	}
 
-	(void) fclose(fp);
+	(void) fclose(wfp);
+	(void) fclose(rfp);
 	return (0);
 }
 
